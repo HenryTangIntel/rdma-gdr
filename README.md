@@ -7,9 +7,9 @@ A client-server implementation for DMA buffer operations using RDMA verbs on Hab
 This project demonstrates how to use RDMA (Remote Direct Memory Access) verbs with DMA buffers on Habana Gaudi hardware. It consists of a client and server implementation that establish a connection and perform memory operations directly between devices.
 
 ## Summary:
-This implementation has successfully achieved:
-
-✅ Zero-copy data transfer between Gaudi and NIC  
+This implementation has successfully achieved:  
+****
+✅ Zero-copy data transfer between Gaudi and NIC 
 ✅ Direct DMA-buf registration without CPU mapping  
 ✅ Bidirectional communication using Send/Receive  
 ✅ One-sided RDMA Write operations  
