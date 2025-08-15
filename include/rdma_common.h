@@ -1,6 +1,6 @@
-// rdma_dmabuf_common.h
-#ifndef RDMA_DMABUF_COMMON_H
-#define RDMA_DMABUF_COMMON_H
+// rdma_common.h
+#ifndef RDMA_COMMON_H
+#define RDMA_COMMON_H
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -14,7 +14,6 @@
 #include <sys/mman.h>
 #include <netdb.h>
 #include <infiniband/verbs.h>
-#include "hlthunk.h"
 
 #define MSG_SIZE 1024
 #define RDMA_BUFFER_SIZE (4 * 1024 * 1024)  // 4MB default
@@ -30,13 +29,6 @@ struct cm_con_data_t {
 
 // RDMA resources
 typedef struct {
-    // Gaudi resources
-    int gaudi_fd;
-    int dmabuf_fd;
-    uint64_t gaudi_handle;
-    uint64_t device_va;
-    struct hlthunk_hw_ip_info hw_info;
-    
     // IB resources
     struct ibv_context *ib_ctx;
     struct ibv_pd *pd;
@@ -51,19 +43,17 @@ typedef struct {
     
     // Buffer info
     size_t buffer_size;
-    void *buffer;  // For CPU access if available
-    uint64_t host_device_va;  // Host buffer mapped to Gaudi
+    void *buffer;       // Host memory buffer
 } rdma_context_t;
 
 // Function declarations
-int init_gaudi_dmabuf(rdma_context_t *ctx, size_t size);
+int init_rdma_buffer(rdma_context_t *ctx, size_t size);
 int init_rdma_resources(rdma_context_t *ctx, const char *ib_dev_name);
 int connect_qp(rdma_context_t *ctx, const char *server_name, int port);
 int post_send(rdma_context_t *ctx, int opcode);
 int post_receive(rdma_context_t *ctx);
 int poll_completion(rdma_context_t *ctx);
 void cleanup_resources(rdma_context_t *ctx);
-void simulate_hpu_operation(rdma_context_t *ctx, const char *operation);
 
 // Helper functions
 static inline uint64_t htonll(uint64_t val) {
@@ -74,4 +64,4 @@ static inline uint64_t ntohll(uint64_t val) {
     return be64toh(val);
 }
 
-#endif // RDMA_DMABUF_COMMON_H
+#endif // RDMA_COMMON_H

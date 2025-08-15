@@ -2,8 +2,6 @@
 
 int main(int argc, char *argv[]) {
     rdma_context_t ctx = {0};
-    ctx.gaudi_fd = -1;
-    ctx.dmabuf_fd = -1;
     ctx.sock = -1;
     
     int port = 20000;
@@ -24,25 +22,19 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    printf("RDMA DMA-buf Server\n");
-    printf("===================\n");
+    printf("RDMA Server\n");
+    printf("===========\n");
     printf("Port: %d\n", port);
     printf("Buffer size: %zu bytes\n", buffer_size);
     if (ib_dev_name) printf("IB device: %s\n", ib_dev_name);
     printf("\n");
     
-    // Initialize Gaudi DMA-buf
-    printf("Initializing Gaudi DMA-buf...\n");
-    if (init_gaudi_dmabuf(&ctx, buffer_size) < 0) {
-        fprintf(stderr, "Failed to initialize Gaudi DMA-buf\n");
+    // Initialize RDMA buffer
+    printf("Initializing RDMA buffer...\n");
+    if (init_rdma_buffer(&ctx, buffer_size) < 0) {
+        fprintf(stderr, "Failed to initialize RDMA buffer\n");
         cleanup_resources(&ctx);
         return 1;
-    }
-    
-    if (ctx.dmabuf_fd >= 0) {
-        printf("✓ Gaudi DMA-buf allocated (fd=%d, va=0x%lx)\n", ctx.dmabuf_fd, ctx.device_va);
-    } else {
-        printf("✓ Using regular memory buffer\n");
     }
     
     // Initialize RDMA resources
@@ -52,7 +44,6 @@ int main(int argc, char *argv[]) {
         cleanup_resources(&ctx);
         return 1;
     }
-    printf("✓ RDMA resources initialized\n");
     
     // Wait for client connection
     printf("\nWaiting for client connection on port %d...\n", port);
@@ -65,11 +56,6 @@ int main(int argc, char *argv[]) {
     
     // Function to display buffer data (first few integers)
     void display_buffer_data(const char *label, void *buffer, size_t size) {
-        if (!buffer) {
-            printf("%s: Data in device memory (no CPU access)\n", label);
-            return;
-        }
-        
         int *int_data = (int *)buffer;
         int count = size / sizeof(int);
         int display_count = count > 10 ? 10 : count;
@@ -81,123 +67,117 @@ int main(int argc, char *argv[]) {
         printf("...\n");
     }
     
-    // Initialize buffer with test pattern if CPU accessible
-    if (ctx.buffer) {
-        printf("\n[CPU→HPU] Writing initial data pattern to buffer...\n");
-        int *int_data = (int *)ctx.buffer;
-        int count = MSG_SIZE / sizeof(int);
-        
-        // Write a recognizable pattern
-        for (int i = 0; i < count; i++) {
-            int_data[i] = 1000 + i;  // Pattern: 1000, 1001, 1002...
-        }
-        
-        display_buffer_data("[CPU] Initial server data", ctx.buffer, MSG_SIZE);
-        
-        if (ctx.host_device_va) {
-            printf("[HPU] Data accessible at device VA 0x%lx\n", ctx.host_device_va);
-        }
-    } else {
-        printf("Note: Buffer is in device memory - would be initialized by Gaudi kernel\n");
+    // Initialize buffer with server's test pattern
+    printf("\n[Server] Initializing buffer with server data...\n");
+    int *int_data = (int *)ctx.buffer;
+    int count = MSG_SIZE / sizeof(int);
+    
+    // Write a recognizable server pattern
+    for (int i = 0; i < count; i++) {
+        int_data[i] = 1000 + i;  // Pattern: 1000, 1001, 1002...
     }
     
+    display_buffer_data("[Server] Initial server data", ctx.buffer, MSG_SIZE);
+    
     // Main communication loop
-    printf("\nStarting communication...\n");
+    printf("\nStarting communication loop...\n");
     
     for (int i = 0; i < 3; i++) {
         printf("\n--- Iteration %d ---\n", i + 1);
         
-        // Post receive for client's message
+        // Post receive to wait for client message
+        printf("Waiting for client message...\n");
         if (post_receive(&ctx) < 0) {
             fprintf(stderr, "Failed to post receive\n");
             break;
         }
         
-        // Wait for client's message
-        printf("Waiting for client message...\n");
         if (poll_completion(&ctx) < 0) {
-            fprintf(stderr, "Failed to receive message\n");
+            fprintf(stderr, "Receive completion failed\n");
             break;
         }
         
-        if (ctx.buffer) {
-            printf("[HPU→CPU] Reading received data:\n");
-            display_buffer_data("Received from client", ctx.buffer, MSG_SIZE);
-            
-            // Simulate HPU processing: multiply each value by 2
-            printf("[HPU] Processing data (multiplying by 2)...\n");
-            int *int_data = (int *)ctx.buffer;
-            int count = MSG_SIZE / sizeof(int);
-            for (int j = 0; j < count && j < 256; j++) {  // Process first 256 ints
-                int_data[j] *= 2;
-            }
-            
-            display_buffer_data("[CPU] After HPU processing", ctx.buffer, MSG_SIZE);
-        } else {
-            printf("Received data in device memory\n");
+        display_buffer_data("[Server] Received from client", ctx.buffer, MSG_SIZE);
+        printf("✓ Message received successfully\n");
+        
+        // Prepare response data
+        printf("Preparing response to client...\n");
+        for (int j = 0; j < count; j++) {
+            int_data[j] = 1000 + i * 100 + j;  // Pattern: 1000, 1100, 1200...
         }
         
-        // Send response
-        printf("Sending response...\n");
+        display_buffer_data("[Server] Sending response", ctx.buffer, MSG_SIZE);
+        
+        // Send response back to client
         if (post_send(&ctx, IBV_WR_SEND) < 0) {
             fprintf(stderr, "Failed to post send\n");
             break;
         }
         
         if (poll_completion(&ctx) < 0) {
-            fprintf(stderr, "Failed to send message\n");
+            fprintf(stderr, "Send completion failed\n");
             break;
         }
-        printf("✓ Response sent\n");
-    }
-    
-    // RDMA Write test
-    printf("\n--- RDMA Write Test ---\n");
-    if (ctx.buffer) {
-        printf("[CPU→HPU] Preparing RDMA Write data...\n");
-        int *int_data = (int *)ctx.buffer;
-        // Write a special pattern for RDMA Write
-        for (int i = 0; i < 10; i++) {
-            int_data[i] = 9000 + i;  // Pattern: 9000, 9001, 9002...
+        printf("✓ Response sent successfully\n");
+        
+        // Check if we received RDMA Write data (iteration 2)
+        if (i == 1) {
+            printf("\nChecking for RDMA Write data from client...\n");
+            // Give client time to perform RDMA write
+            usleep(200000);  // 200ms
+            
+            display_buffer_data("[Server] Buffer after potential RDMA Write", ctx.buffer, MSG_SIZE);
+            
+            // Check if buffer was modified by RDMA write
+            int rdma_write_detected = 0;
+            for (int j = 0; j < count && j < 10; j++) {
+                if (int_data[j] >= 3000 && int_data[j] < 4000) {
+                    rdma_write_detected = 1;
+                    break;
+                }
+            }
+            
+            if (rdma_write_detected) {
+                printf("✓ RDMA Write from client detected!\n");
+                printf("  Client successfully wrote data directly to server memory\n");
+            } else {
+                printf("? RDMA Write data not detected (may have been overwritten)\n");
+            }
+            
+            // Demonstrate server-side RDMA Write
+            printf("\nDemonstrating server RDMA Write to client...\n");
+            
+            // Prepare server's RDMA write data
+            for (int j = 0; j < count; j++) {
+                int_data[j] = 4000 + j;  // Pattern: 4000, 4001, 4002...
+            }
+            
+            display_buffer_data("[Server] RDMA Write data", ctx.buffer, MSG_SIZE);
+            
+            if (post_send(&ctx, IBV_WR_RDMA_WRITE) < 0) {
+                fprintf(stderr, "Failed to post RDMA write\n");
+                break;
+            }
+            
+            if (poll_completion(&ctx) < 0) {
+                fprintf(stderr, "RDMA write completion failed\n");
+                break;
+            }
+            printf("✓ Server RDMA Write completed (one-sided to client)\n");
         }
-        display_buffer_data("[CPU] RDMA Write data", ctx.buffer, MSG_SIZE);
+        
+        // Small delay between iterations
+        usleep(100000);  // 100ms
     }
     
-    printf("Performing RDMA Write to client...\n");
-    if (post_send(&ctx, IBV_WR_RDMA_WRITE) < 0) {
-        fprintf(stderr, "Failed to post RDMA write\n");
-    } else if (poll_completion(&ctx) < 0) {
-        fprintf(stderr, "RDMA write failed\n");
-    } else {
-        printf("✓ RDMA Write completed\n");
-    }
-    
-    // Wait for client to finish
-    printf("\nWaiting for client to finish...\n");
-    char sync_byte;
-    if (read(ctx.sock, &sync_byte, 1) == 1) {
-        printf("✓ Client finished\n");
-    }
-    
-    // Print summary
-    printf("\n=== Summary ===\n");
-    if (ctx.dmabuf_fd >= 0) {
-        printf("✅ Zero-copy RDMA using Gaudi DMA-buf\n");
-        printf("   - Gaudi device memory: 0x%lx\n", ctx.device_va);
-        printf("   - DMA-buf fd: %d\n", ctx.dmabuf_fd);
-        printf("   - Direct device-to-network transfers\n");
-    } else {
-        printf("✅ RDMA using regular memory\n");
-        printf("   - Host buffer: %p\n", ctx.buffer);
-    }
-    printf("\n📊 Operations Summary:\n");
-    printf("   ✓ Send/Receive: 3 iterations completed\n");
-    printf("   ✓ RDMA Write: Successfully pushed data to client\n");
-    printf("\n💡 Note: RDMA Read operations are typically not supported\n");
-    printf("   with device memory due to DMA initiator requirements.\n");
-    printf("   Use RDMA Write to push data or Send/Receive for bidirectional.\n");
+    printf("\nCommunication completed successfully!\n");
+    printf("Server demonstrated:\n");
+    printf("  ✓ Send/Receive operations\n");
+    printf("  ✓ RDMA Write (one-sided to client)\n");
+    printf("  ✓ RDMA Write reception (from client)\n");
+    printf("  ✓ Memory registration and management\n");
+    printf("  ✓ Connection establishment\n");
     
     cleanup_resources(&ctx);
-    printf("\nServer shutdown complete\n");
     return 0;
 }

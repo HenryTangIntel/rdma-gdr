@@ -1,97 +1,20 @@
 #include "rdma_common.h"
 
-// Initialize Gaudi device and allocate DMA-buf
-int init_gaudi_dmabuf(rdma_context_t *ctx, size_t size) {
+// Initialize RDMA buffer with host memory
+int init_rdma_buffer(rdma_context_t *ctx, size_t size) {
     ctx->buffer_size = size;
     
-    // Try to open Gaudi device
-    enum hlthunk_device_name devices[] = {
-        HLTHUNK_DEVICE_GAUDI3,
-        HLTHUNK_DEVICE_GAUDI2,
-        HLTHUNK_DEVICE_GAUDI,
-        HLTHUNK_DEVICE_DONT_CARE
-    };
-    
-    for (int i = 0; i < 4; i++) {
-        ctx->gaudi_fd = hlthunk_open(devices[i], NULL);
-        if (ctx->gaudi_fd >= 0) break;
-    }
-    
-    if (ctx->gaudi_fd < 0) {
-        printf("No Gaudi device found, using regular memory\n");
-        ctx->buffer = aligned_alloc(4096, size);
-        if (!ctx->buffer) return -1;
-        memset(ctx->buffer, 0, size);
-        ctx->dmabuf_fd = -1;
-        return 0;
-    }
-    
-    // Get hardware info
-    if (hlthunk_get_hw_ip_info(ctx->gaudi_fd, &ctx->hw_info) != 0) {
-        hlthunk_close(ctx->gaudi_fd);
-        ctx->gaudi_fd = -1;
+    // Allocate aligned host memory
+    ctx->buffer = aligned_alloc(4096, size);
+    if (!ctx->buffer) {
+        fprintf(stderr, "Failed to allocate buffer memory\n");
         return -1;
     }
     
-    printf("Gaudi device opened successfully\n");
+    // Initialize buffer with zeros
+    memset(ctx->buffer, 0, size);
     
-    // Allocate device memory
-    ctx->gaudi_handle = hlthunk_device_memory_alloc(ctx->gaudi_fd, size, 0, true, true);
-    if (ctx->gaudi_handle == 0) {
-        printf("Failed to allocate Gaudi memory, using regular memory\n");
-        hlthunk_close(ctx->gaudi_fd);
-        ctx->gaudi_fd = -1;
-        ctx->buffer = aligned_alloc(4096, size);
-        if (!ctx->buffer) return -1;
-        memset(ctx->buffer, 0, size);
-        ctx->dmabuf_fd = -1;
-        return 0;
-    }
-    
-    // Map device memory
-    ctx->device_va = hlthunk_device_memory_map(ctx->gaudi_fd, ctx->gaudi_handle, 0);
-    if (ctx->device_va == 0) {
-        hlthunk_device_memory_free(ctx->gaudi_fd, ctx->gaudi_handle);
-        hlthunk_close(ctx->gaudi_fd);
-        return -1;
-    }
-    
-    // Export as DMA-buf
-    ctx->dmabuf_fd = hlthunk_device_mapped_memory_export_dmabuf_fd(
-        ctx->gaudi_fd, ctx->device_va, size, 0, (O_RDWR | O_CLOEXEC));
-    
-    if (ctx->dmabuf_fd < 0) {
-        printf("DMA-buf export failed, creating host-mapped buffer\n");
-        // Fallback: allocate host memory and map it to Gaudi
-        ctx->buffer = aligned_alloc(4096, size);
-        if (!ctx->buffer) {
-            hlthunk_memory_unmap(ctx->gaudi_fd, ctx->device_va);
-            hlthunk_device_memory_free(ctx->gaudi_fd, ctx->gaudi_handle);
-            return -1;
-        }
-        memset(ctx->buffer, 0, size);
-        
-        // Map host buffer to Gaudi's address space for CPU-HPU data transfer
-        ctx->host_device_va = hlthunk_host_memory_map(ctx->gaudi_fd, ctx->buffer, 0, size);
-        if (ctx->host_device_va) {
-            printf("Host buffer mapped to Gaudi at 0x%lx\n", ctx->host_device_va);
-            printf("CPU can now read/write data that HPU can access\n");
-        } else {
-            printf("Host memory mapping to Gaudi failed, but buffer still usable\n");
-        }
-    } else {
-        printf("DMA-buf created successfully (fd=%d)\n", ctx->dmabuf_fd);
-        // For DMA-buf case, we might still want CPU access for debugging
-        // Try to mmap the DMA-buf
-        ctx->buffer = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, ctx->dmabuf_fd, 0);
-        if (ctx->buffer == MAP_FAILED) {
-            ctx->buffer = NULL;
-            printf("DMA-buf mmap failed - CPU access not available (this is normal)\n");
-        } else {
-            printf("DMA-buf mapped to CPU address %p\n", ctx->buffer);
-        }
-    }
-    
+    printf("✓ Allocated %zu bytes of host memory at %p\n", size, ctx->buffer);
     return 0;
 }
 
@@ -117,7 +40,6 @@ int init_rdma_resources(rdma_context_t *ctx, const char *ib_dev_name) {
     struct ibv_device **dev_list = NULL;
     struct ibv_device *ib_dev = NULL;
     int num_devices, i;
-    int result = -1;
     
     // Get device list
     dev_list = ibv_get_device_list(&num_devices);
@@ -148,7 +70,7 @@ int init_rdma_resources(rdma_context_t *ctx, const char *ib_dev_name) {
         return -1;
     }
     
-    printf("Opened IB device: %s\n", ibv_get_device_name(ib_dev));
+    printf("✓ Opened IB device: %s\n", ibv_get_device_name(ib_dev));
     
     // Query port
     if (ibv_query_port(ctx->ib_ctx, 1, &ctx->port_attr)) {
@@ -173,37 +95,18 @@ int init_rdma_resources(rdma_context_t *ctx, const char *ib_dev_name) {
         return -1;
     }
     
-    // Register memory - ensure all access flags are set
+    // Register memory
     int mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | 
                    IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
     
-    if (ctx->dmabuf_fd >= 0) {
-        // Try direct DMA-buf registration
-        ctx->mr = ibv_reg_dmabuf_mr(ctx->pd, 0, ctx->buffer_size, 
-                                    (uint64_t)ctx->device_va, ctx->dmabuf_fd, mr_flags);
-        if (ctx->mr) {
-            printf("DMA-buf registered successfully with IB\n");
-        } else {
-            printf("DMA-buf registration failed, trying fallback\n");
-        }
-    }
-    
-    if (!ctx->mr && ctx->buffer) {
-        // Register regular memory
-        ctx->mr = ibv_reg_mr(ctx->pd, ctx->buffer, ctx->buffer_size, mr_flags);
-        if (!ctx->mr) {
-            fprintf(stderr, "Failed to register memory\n");
-            cleanup_rdma_init_resources(ctx, dev_list);
-            return -1;
-        }
-        printf("Regular memory registered with IB\n");
-    }
-    
+    ctx->mr = ibv_reg_mr(ctx->pd, ctx->buffer, ctx->buffer_size, mr_flags);
     if (!ctx->mr) {
-        fprintf(stderr, "No memory could be registered\n");
+        fprintf(stderr, "Failed to register memory\n");
         cleanup_rdma_init_resources(ctx, dev_list);
         return -1;
     }
+    printf("✓ Memory registered with IB (lkey=0x%x, rkey=0x%x)\n", 
+           ctx->mr->lkey, ctx->mr->rkey);
     
     // Create QP
     struct ibv_qp_init_attr qp_init_attr = {
@@ -225,6 +128,8 @@ int init_rdma_resources(rdma_context_t *ctx, const char *ib_dev_name) {
         cleanup_rdma_init_resources(ctx, dev_list);
         return -1;
     }
+    
+    printf("✓ Queue Pair created (QP num: %d)\n", ctx->qp->qp_num);
     
     ibv_free_device_list(dev_list);
     return 0;
@@ -358,11 +263,7 @@ int connect_qp(rdma_context_t *ctx, const char *server_name, int port) {
     }
     
     // Prepare local connection data
-    if (ctx->dmabuf_fd >= 0) {
-        local_con_data.addr = htonll(ctx->device_va);
-    } else {
-        local_con_data.addr = htonll((uintptr_t)ctx->buffer);
-    }
+    local_con_data.addr = htonll((uintptr_t)ctx->buffer);
     local_con_data.rkey = htonl(ctx->mr->rkey);
     local_con_data.qp_num = htonl(ctx->qp->qp_num);
     local_con_data.lid = htons(ctx->port_attr.lid);
@@ -382,6 +283,9 @@ int connect_qp(rdma_context_t *ctx, const char *server_name, int port) {
     ctx->remote_props.lid = ntohs(remote_con_data.lid);
     memcpy(ctx->remote_props.gid, remote_con_data.gid, 16);
     
+    printf("✓ Remote properties: addr=0x%lx, rkey=0x%x, qp_num=%d\n",
+           ctx->remote_props.addr, ctx->remote_props.rkey, ctx->remote_props.qp_num);
+    
     // Modify QP states
     if (modify_qp_to_init(ctx->qp)) {
         fprintf(stderr, "Failed to modify QP to INIT\n");
@@ -399,6 +303,8 @@ int connect_qp(rdma_context_t *ctx, const char *server_name, int port) {
         return -1;
     }
     
+    printf("✓ QP state transitions completed (INIT→RTR→RTS)\n");
+    
     // Sync before starting
     if (sock_sync_data(ctx->sock, 1, "Q", &temp_char)) {
         fprintf(stderr, "Sync error\n");
@@ -411,7 +317,7 @@ int connect_qp(rdma_context_t *ctx, const char *server_name, int port) {
 // Post send operation
 int post_send(rdma_context_t *ctx, int opcode) {
     struct ibv_sge sge = {
-        .addr = ctx->dmabuf_fd >= 0 ? ctx->device_va : (uintptr_t)ctx->buffer,
+        .addr = (uintptr_t)ctx->buffer,
         .length = MSG_SIZE,
         .lkey = ctx->mr->lkey
     };
@@ -436,7 +342,7 @@ int post_send(rdma_context_t *ctx, int opcode) {
 // Post receive operation
 int post_receive(rdma_context_t *ctx) {
     struct ibv_sge sge = {
-        .addr = ctx->dmabuf_fd >= 0 ? ctx->device_va : (uintptr_t)ctx->buffer,
+        .addr = (uintptr_t)ctx->buffer,
         .length = MSG_SIZE,
         .lkey = ctx->mr->lkey
     };
@@ -484,32 +390,8 @@ void cleanup_resources(rdma_context_t *ctx) {
     if (ctx->pd) ibv_dealloc_pd(ctx->pd);
     if (ctx->ib_ctx) ibv_close_device(ctx->ib_ctx);
     
-    if (ctx->dmabuf_fd >= 0) {
-        close(ctx->dmabuf_fd);
-    }
-    
-    if (ctx->buffer && ctx->dmabuf_fd < 0) {
-        // Unmap from Gaudi if it was mapped
-        if (ctx->host_device_va && ctx->gaudi_fd >= 0) {
-            hlthunk_memory_unmap(ctx->gaudi_fd, ctx->host_device_va);
-        }
+    if (ctx->buffer) {
         free(ctx->buffer);
-    } else if (ctx->buffer) {
-        // Unmap DMA-buf mmap
-        munmap(ctx->buffer, ctx->buffer_size);
-    }
-    
-    if (ctx->gaudi_handle) {
-        if (ctx->device_va) {
-            hlthunk_memory_unmap(ctx->gaudi_fd, ctx->device_va);
-        }
-        hlthunk_device_memory_free(ctx->gaudi_fd, ctx->gaudi_handle);
-    } else if (ctx->buffer) {
-        free(ctx->buffer);
-    }
-    
-    if (ctx->gaudi_fd >= 0) {
-        hlthunk_close(ctx->gaudi_fd);
     }
     
     if (ctx->sock >= 0) {
